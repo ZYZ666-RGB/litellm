@@ -31,6 +31,18 @@ Edit `providers.json` and add your provider:
 
 That's it! The provider will be automatically loaded and available.
 
+### From a file at startup
+
+Pass the same JSON at startup instead of editing the bundled file and rebuilding an image.
+
+```
+litellm --providers my-providers.json
+```
+
+The file uses the shape above. Entries are added to the bundled providers, and a slug that already exists uses the entry from this file. A missing path stops startup the same way a missing `--config` does. `PROVIDERS_FILE_PATH` names the same file when the flag is not passed, the way `CONFIG_FILE_PATH` does for `--config`.
+
+An external entry requires an explicit `api_key` on the call or a value for its configured `api_key_env`. If both are missing, the call fails before contacting the provider. External entries do not fall back to OpenAI credentials. Bundled providers keep their existing credential behavior.
+
 ### Optional Configuration Fields
 
 ```json
@@ -42,6 +54,11 @@ That's it! The provider will be automatically loaded and available.
     // Optional: Override base_url via environment variable
     "api_base_env": "YOUR_PROVIDER_API_BASE",
     
+    // Optional: User-Agent sent on chat requests. {version} and {python}
+    // expand to the running litellm and Python versions. LITELLM_USER_AGENT
+    // replaces it, and a User-Agent the caller sets always wins
+    "user_agent": "litellm/{version} Python/{python}",
+
     // Optional: Which base class to use (default: "openai_gpt")
     "base_class": "openai_gpt",  // or "openai_like"
     
@@ -61,6 +78,12 @@ That's it! The provider will be automatically loaded and available.
     },
     
     // Optional: Special handling flags
+    // convert_content_list_to_string keeps only the text of every content list
+    // convert_text_content_list_to_string joins a list of only text parts with
+    // newlines and sends a list with any other part as it is
+    // round_reasoning_effort_to_declared_levels sends reasoning_effort as the
+    // nearest level in the model's reasoning_effort_levels cost map row, and
+    // drops a level the row does not declare under drop_params
     "special_handling": {
       "convert_content_list_to_string": true
     },
@@ -134,6 +157,31 @@ When only some models serve an endpoint natively, list them under `model_support
     "model_supported_endpoints": {
       "model-a": ["/v1/messages"],
       "model-b": ["/v1/responses"]
+    }
+  }
+}
+```
+
+When some models are served at a different base URL than the rest, list them under `model_base_urls`. A deployment's `api_base` and the provider's `api_base_env` still take precedence:
+
+```json
+{
+  "your_provider": {
+    "base_url": "https://api.example.com/v2",
+    "model_base_urls": {
+      "legacy-model": "https://api.example.com/v1"
+    }
+  }
+}
+```
+
+When only some models need a `special_handling` flag, set it under `model_special_handling`. A model's flags override the provider's:
+
+```json
+{
+  "your_provider": {
+    "model_special_handling": {
+      "legacy-model": {"convert_content_list_to_string": true}
     }
   }
 }
