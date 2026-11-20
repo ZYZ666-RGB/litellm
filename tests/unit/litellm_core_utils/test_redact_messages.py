@@ -37,10 +37,12 @@ from litellm.litellm_core_utils.redact_messages import (
     should_redact_message_logging,
 )
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
+from litellm.proxy.spend_tracking.compression_savings import extract_compression_saved_tokens
 from litellm.responses.main import mock_responses_api_response
 from litellm.types.responses.main import build_web_search_call
 from litellm.types.router import BaselineRouteStamp
 from litellm.types.utils import (
+    ChatCompletionAudioResponse,
     ModelResponse,
     ModelResponseStream,
     ResponsesAPIResponse,
@@ -236,6 +238,113 @@ def test_streaming_redaction_redacts_delta_provider_fields_without_touching_the_
     assert SECRET not in str(response.choices[0].delta), response
     assert response.choices[0].delta.provider_specific_fields["thought_signatures"] == [SIGNATURE]
     assert fields == _provider_fields()
+
+
+def _audio_response() -> ModelResponse:
+    return ModelResponse(
+        choices=[
+            litellm.Choices(
+                message=litellm.Message(
+                    content=None,
+                    audio=ChatCompletionAudioResponse(data=SECRET, expires_at=1, transcript="", id="audio_1"),
+                )
+            )
+        ]
+    )
+
+
+@pytest.mark.parametrize("key", ["complete_streaming_response", "async_complete_streaming_response"])
+def test_redaction_drops_audio_from_logged_response_objects_without_touching_the_client_response(key: str) -> None:
+    client_response: Final = _audio_response()
+    details: Final[dict[str, object]] = {"stream": True, key: _audio_response()}
+
+    redacted: Final = perform_redaction(details, client_response)
+
+    assert SECRET not in str(redacted), redacted
+    assert SECRET not in str(details[key]), details[key]
+    assert client_response.choices[0].message.audio is not None
+    assert client_response.choices[0].message.audio.data == SECRET
+
+
+@pytest.mark.parametrize("key", ["complete_streaming_response", "async_complete_streaming_response"])
+def test_streaming_redaction_drops_delta_audio(key: str) -> None:
+    response: Final = ModelResponseStream(
+        choices=[litellm.utils.StreamingChoices(delta=litellm.utils.Delta(audio={"data": SECRET}))]
+    )
+    details: Final[dict[str, object]] = {"stream": True, key: response}
+
+    perform_redaction(details, None)
+
+    assert SECRET not in str(response.choices[0].delta), response
+
+
+_IMAGE_URL: Final = f"https://example.com/generated.png?signature={SECRET}"
+
+
+def _image_response() -> ModelResponse:
+    return ModelResponse(
+        choices=[
+            litellm.Choices(
+                message=litellm.Message(
+                    content=None,
+                    images=[{"index": 0, "type": "image_url", "image_url": {"url": _IMAGE_URL}}],
+                )
+            )
+        ]
+    )
+
+
+@pytest.mark.parametrize("shape", ["object", "dict", "standard"])
+def test_redaction_drops_generated_images_from_the_logged_chat_response_only(shape: str) -> None:
+    client_response: Final = _image_response()
+
+    redacted: Final = (
+        redacted_standard_logging_payload({"response": client_response.model_dump()})
+        if shape == "standard"
+        else perform_redaction({}, client_response if shape == "object" else client_response.model_dump())
+    )
+
+    assert SECRET not in str(redacted), redacted
+    assert client_response.choices[0].message.images == [
+        {"index": 0, "type": "image_url", "image_url": {"url": _IMAGE_URL}}
+    ]
+
+
+@pytest.mark.parametrize("key", ["complete_streaming_response", "async_complete_streaming_response"])
+def test_streaming_redaction_drops_delta_images(key: str) -> None:
+    response: Final = ModelResponseStream(
+        choices=[
+            litellm.utils.StreamingChoices(
+                delta=litellm.utils.Delta(images=[{"index": 0, "type": "image_url", "image_url": {"url": _IMAGE_URL}}])
+            )
+        ]
+    )
+
+    perform_redaction({"stream": True, key: response}, None)
+
+    assert SECRET not in str(response.choices[0].delta), response
+
+
+@pytest.mark.parametrize("shape", ["object", "dict", "standard"])
+def test_redaction_hides_the_image_generation_result_in_responses_api_output(shape: str) -> None:
+    response: Final = ResponsesAPIResponse(
+        id="resp_1",
+        created_at=1,
+        model="gpt-5.6",
+        object="response",
+        status="completed",
+        output=[{"id": "ig_1", "type": "image_generation_call", "status": "completed", "result": SECRET}],
+    )
+
+    redacted: Final = (
+        redacted_standard_logging_payload({"response": response.model_dump()})["response"]
+        if shape == "standard"
+        else perform_redaction({}, response if shape == "object" else response.model_dump())
+    )
+
+    item: Final = redacted.output[0].model_dump() if shape == "object" else redacted["output"][0]
+    assert (item["id"], item["status"], item["result"]) == ("ig_1", "completed", REDACTED_BY_LITELLM)
+    assert response.output[0].result == SECRET
 
 
 _SECRET_URL: Final = f"https://example.com/?q={SECRET}"
@@ -2011,6 +2120,80 @@ def test_request_body_redaction_replaces_instructions_only_when_sent() -> None:
     assert "instructions" not in chat_body
 
 
+def _vector_store_search_details(query_image: Mapping[str, str]) -> dict[str, object]:
+    return {
+        "query_image": query_image,
+        "optional_params": {"query_image": query_image},
+        "litellm_params": {"proxy_server_request": {"body": {"query_image": query_image}}},
+        "standard_logging_object": {"model_parameters": {"query_image": query_image}, "messages": [], "response": {}},
+    }
+
+
+def test_redaction_removes_a_vector_store_query_image_from_every_logged_copy() -> None:
+    details: Final = _vector_store_search_details({"type": "base64", "media_type": "image/jpeg", "data": SECRET})
+
+    perform_redaction(details, result=None)
+
+    assert details["query_image"] == REDACTED_BY_LITELLM
+    assert SECRET not in json.dumps(details, default=str)
+
+
+def test_redaction_removes_a_query_image_sent_inside_extra_body() -> None:
+    image: Final = {"type": "base64", "media_type": "image/jpeg", "data": SECRET}
+    details: Final[dict[str, object]] = {
+        "optional_params": {"extra_body": {"query_image": image}},
+        "litellm_params": {"proxy_server_request": {"body": {"extra_body": {"query_image": image}}}},
+    }
+
+    perform_redaction(details, result=None)
+
+    assert SECRET not in json.dumps(details, default=str)
+
+
+@pytest.mark.parametrize("retrieval_query_param", ["retrievalQuery", "retrieval_query"])
+def test_redaction_removes_a_raw_retrieval_query_sent_inside_extra_body(retrieval_query_param: str) -> None:
+    retrieval_query: Final = {"type": "IMAGE", "image": {"format": "jpeg", "inlineContent": SECRET}}
+    details: Final[dict[str, object]] = {
+        "litellm_params": {"proxy_server_request": {"body": {"extra_body": {retrieval_query_param: retrieval_query}}}},
+    }
+
+    perform_redaction(details, result=None)
+
+    assert SECRET not in json.dumps(details, default=str)
+
+
+def test_redaction_removes_the_image_from_the_provider_request_copy() -> None:
+    retrieval_query: Final = {"type": "IMAGE", "image": {"format": "jpeg", "inlineContent": SECRET}}
+    details: Final[dict[str, object]] = {
+        "additional_args": {"complete_input_dict": {"retrievalQuery": retrieval_query, "knowledgeBaseId": "kb"}},
+    }
+
+    perform_redaction(details, result=None)
+
+    assert SECRET not in json.dumps(details, default=str)
+    assert details["additional_args"]["complete_input_dict"]["knowledgeBaseId"] == "kb"
+
+
+def test_one_callback_opting_out_redacts_a_query_image_only_for_itself() -> None:
+    details: Final = _vector_store_search_details({"type": "base64", "media_type": "image/jpeg", "data": SECRET})
+
+    redacted: Final = redacted_model_call_details_for_custom_logger(details, TestCustomLogger(message_logging=False))
+
+    assert SECRET not in json.dumps(redacted, default=str)
+    assert SECRET in json.dumps(details, default=str)
+
+
+def test_one_callback_opting_out_redacts_an_image_sent_to_apply_guardrail_only_for_itself() -> None:
+    details: Final[dict[str, object]] = {
+        "litellm_params": {"proxy_server_request": {"body": {"images": [f"data:image/png;base64,{SECRET}"]}}},
+    }
+
+    redacted: Final = redacted_model_call_details_for_custom_logger(details, TestCustomLogger(message_logging=False))
+
+    assert SECRET not in json.dumps(redacted, default=str)
+    assert SECRET in json.dumps(details, default=str)
+
+
 @pytest.mark.usefixtures("_vcr_outcome_gate", "drain_logging_worker", "isolate_litellm_state", "setup_and_teardown")
 @pytest.mark.asyncio
 async def test_redaction_responses_api_stream():
@@ -2332,3 +2515,133 @@ def test_perform_redaction_strips_the_matched_text_from_the_bedrock_guardrail_tr
     assert "US_SSN" in redacted.model_dump_json(), "the finding stays, only its matched text goes"
     assert "123-45-6789" not in str(redacted_dict)
     assert "123-45-6789" in response.model_dump_json(), "the caller's own response is not redacted"
+
+
+_GUARDRAIL_RECORD: Final = MappingProxyType(
+    {
+        "guardrail_name": "bedrock-guard",
+        "guardrail_status": "guardrail_intervened",
+        "guardrail_request": {"texts": ["my card is 4111 1111 1111 1111"]},
+        "guardrail_response": {"outputs": [{"text": "my card is 4111 1111 1111 1111"}]},
+        "match_details": [{"snippet": "4111 1111 1111 1111"}],
+        "classification": {"reason": "card 4111 1111 1111 1111"},
+        "guardrail_cost": 0.00075,
+        "duration": 0.4,
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "guardrail_information",
+    [[dict(_GUARDRAIL_RECORD)], dict(_GUARDRAIL_RECORD)],
+    ids=["list", "bare_record"],
+)
+def test_redaction_keeps_the_guardrail_verdict_and_drops_the_prompt_it_quotes(
+    guardrail_information: object,
+) -> None:
+    payload: Final = {"messages": [{"role": "user", "content": "x"}], "guardrail_information": guardrail_information}
+
+    redacted: Final = redacted_standard_logging_payload(payload)["guardrail_information"]
+
+    records: Final = redacted if isinstance(redacted, list) else [redacted]
+    assert "4111" not in str(records)
+    assert [
+        (record["guardrail_name"], record["guardrail_status"], record["guardrail_cost"], record["duration"])
+        for record in records
+    ] == [("bedrock-guard", "guardrail_intervened", 0.00075, 0.4)]
+    assert "4111" in str(payload["guardrail_information"]), "the caller's payload is not redacted in place"
+
+
+def test_redaction_keeps_the_compression_savings_a_guardrail_reports() -> None:
+    payload: Final = {
+        "messages": [{"role": "user", "content": "x"}],
+        "guardrail_information": [
+            {
+                "guardrail_name": "headroom",
+                "guardrail_provider": "headroom",
+                "guardrail_status": "success",
+                "guardrail_response": {
+                    "tokens_before": 1000,
+                    "tokens_after": 400,
+                    "tokens_saved": 600,
+                    "compression_ratio": 0.4,
+                    "compressed_text": "my card is 4111 1111 1111 1111",
+                },
+            }
+        ],
+    }
+
+    redacted: Final = redacted_standard_logging_payload(payload)
+
+    assert "4111" not in str(redacted["guardrail_information"])
+    assert extract_compression_saved_tokens(redacted) == extract_compression_saved_tokens(payload) == 600
+
+
+def test_logged_message_redaction_covers_provider_prompt_fields_and_nested_tool_text():
+    from litellm.litellm_core_utils.redact_messages import redact_logged_message_content
+
+    payload: Final = {
+        "model": "command",
+        "message": "SECRET-COHERE",
+        "inputText": "SECRET-TITAN",
+        "input": {"command": "SECRET-TOOL", "count": 2},
+        "functionCall": {"args": {"q": "SECRET-ARGS"}},
+        "functionResponse": {"response": {"body": "SECRET-RESPONSE", "n": 1}},
+    }
+
+    redacted: Final = redact_logged_message_content(payload)
+
+    rendered: Final = str(redacted)
+    assert "SECRET-COHERE" not in rendered
+    assert "SECRET-TITAN" not in rendered
+    assert "SECRET-TOOL" not in rendered
+    assert "SECRET-ARGS" not in rendered
+    assert "SECRET-RESPONSE" not in rendered
+    assert isinstance(redacted, dict)
+    assert redacted["model"] == "command"
+    assert redacted["input"]["count"] == 2
+    assert redacted["functionResponse"]["response"]["n"] == 1
+
+
+def test_logged_message_redaction_drops_repr_false_fields():
+    from pydantic import BaseModel, Field
+
+    from litellm.litellm_core_utils.redact_messages import redact_logged_message_content
+
+    class StoredUser(BaseModel):
+        user: str
+        password: str = Field(repr=False)
+
+    redacted: Final = redact_logged_message_content(StoredUser(user="ada", password="s3cret-password"))
+
+    assert isinstance(redacted, dict)
+    assert redacted["user"] == "ada"
+    assert "password" not in redacted
+    assert "s3cret-password" not in str(redacted)
+
+
+def test_unmatched_brackets_do_not_make_message_redaction_rescan_the_line():
+    import time
+
+    from litellm.litellm_core_utils.redact_messages import redact_logged_message_content
+
+    started: Final = time.perf_counter()
+    redacted: Final = redact_logged_message_content("[" * 20000)
+    elapsed: Final = time.perf_counter() - started
+
+    assert redacted == "[" * 20000
+    assert elapsed < 1
+
+
+def test_proxy_request_opt_in_reads_the_body_flag_and_the_enable_header():
+    from litellm.litellm_core_utils.redact_messages import proxy_request_opts_into_message_redaction
+
+    assert proxy_request_opts_into_message_redaction({"turn_off_message_logging": True}, {}) is True
+    assert proxy_request_opts_into_message_redaction({}, {"litellm-enable-message-redaction": "true"}) is True
+    assert proxy_request_opts_into_message_redaction({"messages": [{"role": "user", "content": "hi"}]}, {}) is False
+    assert (
+        proxy_request_opts_into_message_redaction(
+            {"turn_off_message_logging": True}, {"litellm-disable-message-redaction": "true"}
+        )
+        is False
+    )

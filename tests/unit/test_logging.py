@@ -27,6 +27,7 @@ from litellm._logging import (
     DiagnosticProcessingFilter,
     JsonFormatter,
     LevelRoutingStreamHandler,
+    MessageContentLogFilter,
     SecretRedactionFilter,
     StdoutLogTruncationFilter,
     _get_uvicorn_json_log_config,
@@ -422,6 +423,17 @@ LITELLM_LOGGER_NAMES = frozenset(
 )
 LOG_LEVEL_METHODS = frozenset({"debug", "info", "warning", "error", "exception", "critical"})
 LITELLM_PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "litellm"
+NON_SDK_SOURCE_DIRS: Final = frozenset(
+    {"cli", "deploy", "enterprise", "packaging", "proxy-extras", "runtime", "rust", "scripts", "ui", "vscode-extension"}
+)
+
+
+def _sdk_source_files() -> tuple[Path, ...]:
+    return tuple(
+        path
+        for path in sorted(LITELLM_PACKAGE_ROOT.rglob("*.py"))
+        if path.relative_to(LITELLM_PACKAGE_ROOT).parts[0] not in NON_SDK_SOURCE_DIRS
+    )
 
 
 def _receiver_name(node: ast.expr) -> str:
@@ -468,7 +480,7 @@ def test_logging_calls_do_not_build_their_message_eagerly():
     """
     offenders = tuple(
         offender
-        for path in sorted(LITELLM_PACKAGE_ROOT.rglob("*.py"))
+        for path in _sdk_source_files()
         for offender in _eager_logging_calls(
             path.read_text(encoding="utf-8"), path.relative_to(LITELLM_PACKAGE_ROOT.parent)
         )
@@ -1077,6 +1089,51 @@ class _CountingPattern:
 
 
 _REQUEST_DUMP = "{'model': 'gpt-4', 'messages': [{'role': 'user', 'content': 'hello world'}]}"
+
+
+@pytest.mark.parametrize("json_logs", [False, True])
+def test_message_privacy_keeps_cached_exception_credentials_scrubbed(
+    json_logs: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(litellm, "turn_off_message_logging", True)
+    monkeypatch.setattr("litellm._logging._ENABLE_SECRET_REDACTION", True)
+    token: Final = "example-bearer-credential-42896"
+    record: Final = logging.LogRecord("LiteLLM", logging.ERROR, __file__, 1, "provider failed", (), None)
+    try:
+        raise ValueError("Authorization: Bearer " + token)
+    except ValueError:
+        record.exc_info = sys.exc_info()
+    MessageContentLogFilter().filter(record)
+    DiagnosticProcessingFilter().filter(record)
+    formatter: Final = JsonFormatter() if json_logs else CorrelationPlainFormatter("%(message)s")
+    rendered: Final = formatter.format(record)
+    assert token not in rendered
+    assert "ValueError" in rendered
+
+
+@pytest.mark.parametrize("private", [False, True])
+def test_json_message_privacy_redacts_structured_extras_without_mutating_the_payload(
+    private: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(litellm, "turn_off_message_logging", private)
+    payload: Final = {"body": {"messages": [{"content": "private-extra-prompt"}], "output_text": "private-extra-reply"}}
+    logger: Final = logging.Logger("native-extra-privacy")
+    record: Final = logger.makeRecord(
+        logger.name,
+        logging.DEBUG,
+        __file__,
+        1,
+        "provider event",
+        (),
+        None,
+        extra={"rust_fields": payload, "content": "private-top-level-extra", "trace_id": "trace-test"},
+    )
+    MessageContentLogFilter().filter(record)
+    rendered: Final = JsonFormatter().format(record)
+    for marker in ("private-extra-prompt", "private-extra-reply", "private-top-level-extra"):
+        assert (marker in rendered) is not private
+    assert payload["body"]["messages"][0]["content"] == "private-extra-prompt"
+    assert json.loads(rendered)["trace_id"] == "trace-test"
 
 
 @pytest.mark.parametrize(

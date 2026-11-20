@@ -7,9 +7,11 @@
 #
 #  Thank you users! We ❤️ you! - Krrish & Ishaan
 
+import ast
 import asyncio
 import copy
 import inspect
+import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Final, Protocol
@@ -21,10 +23,12 @@ from litellm.constants import REDACTED_BY_LITELLM
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.classifier_logging import without_classifier_audit
 from litellm.litellm_core_utils.core_helpers import (
+    as_object_list,
     attribute_or_none,
     get_metadata_variable_name_from_kwargs,
     has_attributes,
 )
+from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 from litellm.litellm_core_utils.served_output_texts import SERVED_OUTPUT_TEXTS_KEY
 from litellm.llms.base_llm.guardrail_translation.utils import stream_item_field, stream_item_items
 from litellm.llms.vertex_ai.common_utils import (
@@ -33,7 +37,8 @@ from litellm.llms.vertex_ai.common_utils import (
 )
 from litellm.secret_managers.main import str_to_bool
 from litellm.types.router import BaselineRouteStamp
-from litellm.types.utils import StandardCallbackDynamicParams
+from litellm.types.utils import PROMPT_CARRYING_GUARDRAIL_FIELDS, StandardCallbackDynamicParams
+from litellm.types.vector_stores import RETRIEVAL_QUERY_PARAMS
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import (
@@ -50,6 +55,32 @@ class _HasArguments(Protocol):
 
 
 MESSAGE_REDACTION_ENABLE_HEADERS: Final = ("litellm-enable-message-redaction", "x-litellm-enable-message-redaction")
+_LOGGED_MESSAGE_TEXT_KEYS: Final = frozenset(
+    {
+        "args",
+        "arguments",
+        "content",
+        "encrypted_content",
+        "input",
+        "inputText",
+        "instructions",
+        "message",
+        "output_text",
+        "prompt",
+        "reasoning_content",
+        "reasoning_text",
+        "refusal",
+        "response",
+        "system",
+        "text",
+        "thinking",
+        "transcript",
+    }
+)
+_DEBUG_CALL_ARGUMENT_KEYS: Final = _LOGGED_MESSAGE_TEXT_KEYS | frozenset({"messages"})
+_MAX_LOG_REDACTION_DEPTH: Final = 32
+_MAX_LOGGED_SPAN_ATTEMPTS: Final = 32
+_LOGGED_STRUCTURE: Final = TypeAdapter(object)
 
 
 def _opted_out_of_message_logging(custom_logger: CustomLogger) -> bool:
@@ -86,8 +117,8 @@ def _redacted_entries_for_opted_out_logger(model_call_details: Mapping[str, obje
         "messages": [{"role": "user", "content": REDACTED_BY_LITELLM}],
         "prompt": "",
         "input": "",
-        **({"instructions": REDACTED_BY_LITELLM} if model_call_details.get("instructions") is not None else {}),
-        **({"optional_params": _with_redacted_instructions(optional_params)} if optional_params is not None else {}),
+        **_request_field_redactions(model_call_details),
+        **({"optional_params": _with_redacted_request_fields(optional_params)} if optional_params is not None else {}),
         **({"litellm_params": redacted_litellm_params(litellm_params)} if litellm_params is not None else {}),
         **(
             {"standard_logging_object": _redact_standard_logging_object(standard_logging_object)}
@@ -222,6 +253,8 @@ def _redact_choice_content(choice):
         if hasattr(choice.message, "thinking_blocks"):
             choice.message.thinking_blocks = None
         _drop_field_when_present(choice.message, "reasoning_items")
+        _drop_field_when_present(choice.message, "audio")
+        _drop_field_when_present(choice.message, "images")
         _redact_provider_specific_fields(choice.message)
         _redact_tool_calls(getattr(choice.message, "tool_calls", None))
         _redact_function_call(getattr(choice.message, "function_call", None))
@@ -233,6 +266,8 @@ def _redact_choice_content(choice):
         if hasattr(choice.delta, "thinking_blocks"):
             choice.delta.thinking_blocks = None
         _drop_field_when_present(choice.delta, "reasoning_items")
+        _drop_field_when_present(choice.delta, "audio")
+        _drop_field_when_present(choice.delta, "images")
         _redact_provider_specific_fields(choice.delta)
         _redact_tool_calls(getattr(choice.delta, "tool_calls", None))
         _redact_function_call(getattr(choice.delta, "function_call", None))
@@ -244,6 +279,42 @@ def _redact_choice_content(choice):
 
 def _as_mapping(value: object) -> Mapping[str, object] | None:
     return value if isinstance(value, Mapping) else None  # pyright: ignore[reportUnknownVariableType]  # keys are read one by one
+
+
+_NUMERIC_COMPRESSION_STAT_KEYS: Final = frozenset(
+    {"tokens_before", "tokens_after", "tokens_saved", "compression_ratio"}
+)
+
+
+def numeric_compression_stats(guardrail_entry: Mapping[str, object]) -> dict[str, int | float] | None:
+    fields: Final = _as_mapping(guardrail_entry.get("guardrail_response"))
+    if fields is None:
+        return None
+    stats: Final = {
+        key: value
+        for key, value in fields.items()
+        if key in _NUMERIC_COMPRESSION_STAT_KEYS and isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+    return stats or None
+
+
+def _guardrail_entry_without_prompt_text(entry: object) -> object:
+    fields: Final = _as_mapping(entry)
+    if fields is None:
+        return entry
+    redacted: Final = {
+        field: REDACTED_BY_LITELLM if field in PROMPT_CARRYING_GUARDRAIL_FIELDS and value is not None else value
+        for field, value in fields.items()
+    }
+    stats: Final = numeric_compression_stats(fields)
+    return redacted if stats is None else {**redacted, "guardrail_response": stats}
+
+
+def _guardrail_information_without_prompt_text(guardrail_information: object) -> object:
+    entries: Final = as_object_list(guardrail_information)
+    if entries is None:
+        return _guardrail_entry_without_prompt_text(guardrail_information)
+    return [_guardrail_entry_without_prompt_text(entry) for entry in entries]
 
 
 def _redact_provider_specific_fields(message: object) -> None:
@@ -351,7 +422,7 @@ def _redacted_web_search_action(action: object) -> object:
 
 def _redacted_web_search_call(item: object) -> object:
     if isinstance(item, BaseModel):
-        action: Final = getattr(item, "action", None)
+        action: Final = attribute_or_none(item, "action")
         return item if action is None else item.model_copy(update={"action": _redacted_web_search_action(action)})
     mapping: Final = _as_mapping(item)
     if mapping is None or mapping.get("action") is None:
@@ -379,8 +450,8 @@ def _redact_responses_api_output(output_items):
     """Helper to redact ResponsesAPIResponse output items."""
     for output_item in output_items:
         output_type = stream_item_field(output_item, "type")
-        if getattr(output_item, "text", None) is not None:
-            output_item.text = REDACTED_BY_LITELLM
+        for field in ("text", "result") if output_type == "image_generation_call" else ("text",):
+            _redact_field_when_present(output_item, field)
 
         for content_part in stream_item_items(output_item, "content"):
             _redact_field_when_present(content_part, "text")
@@ -453,6 +524,11 @@ def _redacted_responses_api_output_item(item: object, redacted_str: str) -> obje
             else {}
         ),
         **(
+            {"result": redacted_str}
+            if item_mapping.get("type") == "image_generation_call" and item_mapping.get("result") is not None
+            else {}
+        ),
+        **(
             {"action": _redacted_web_search_action(item_mapping["action"])}
             if item_mapping.get("type") == "web_search_call" and item_mapping.get("action") is not None
             else {}
@@ -464,8 +540,24 @@ def _redact_responses_api_output_dict(output_items: Sequence[object], redacted_s
     return [_redacted_responses_api_output_item(item, redacted_str) for item in output_items]
 
 
-def _with_redacted_instructions(params: Mapping[str, object]) -> Mapping[str, object]:
-    return params if params.get("instructions") is None else {**params, "instructions": REDACTED_BY_LITELLM}
+_REDACTED_REQUEST_FIELDS: Final = ("instructions", "query_image", "images", *RETRIEVAL_QUERY_PARAMS)
+_NESTED_REQUEST_FIELDS: Final = ("extra_body", "additional_args", "complete_input_dict")
+
+
+def _request_field_redactions(params: Mapping[str, object]) -> Mapping[str, object]:
+    return {
+        **{field: REDACTED_BY_LITELLM for field in _REDACTED_REQUEST_FIELDS if params.get(field) is not None},
+        **{
+            field: _with_redacted_request_fields(nested)
+            for field in _NESTED_REQUEST_FIELDS
+            if (nested := _as_mapping(params.get(field))) is not None
+        },
+    }
+
+
+def _with_redacted_request_fields(params: Mapping[str, object]) -> Mapping[str, object]:
+    redactions: Final = _request_field_redactions(params)
+    return {**params, **redactions} if redactions else params
 
 
 def _redacted_responses_api_response(
@@ -478,37 +570,39 @@ def _redacted_responses_api_response(
         if isinstance(output, list)
         else output,
     }
-    return _with_redacted_instructions(redacted) if redact_instructions else redacted
+    return _with_redacted_request_fields(redacted) if redact_instructions else redacted
 
 
 def redacted_standard_logging_payload(payload: Mapping[str, object]) -> Mapping[str, object]:
     """
-    Return a copy of a ``StandardLoggingPayload`` with its messages and response redacted.
-
-    The success path redacts through ``perform_redaction`` before a callback ever sees the
-    payload, but the failure path does not, so a callback that batches both has to redact
-    the ones it is handed.
+    Return a copy of a ``StandardLoggingPayload`` with its messages, response and guardrail
+    prompt text redacted.
     """
     return _redact_standard_logging_object(payload)
 
 
 def _redact_standard_logging_object(
-    payload: Mapping[str, object], *, redact_instructions: bool = True
+    payload: Mapping[str, object], *, redact_shared_fields: bool = True
 ) -> dict[str, object]:
     standard_logging_object: Final = copy.deepcopy(without_classifier_audit(payload))
     redacted_str: Final = REDACTED_BY_LITELLM
 
     if standard_logging_object.get("messages") is not None:
         standard_logging_object["messages"] = [{"role": "user", "content": redacted_str}]
+    guardrail_information: Final = standard_logging_object.get("guardrail_information")
+    if guardrail_information is not None and redact_shared_fields:
+        standard_logging_object["guardrail_information"] = _guardrail_information_without_prompt_text(
+            guardrail_information
+        )
     model_parameters: Final = _as_mapping(standard_logging_object.get("model_parameters"))
-    if model_parameters is not None and redact_instructions:
-        standard_logging_object["model_parameters"] = _with_redacted_instructions(model_parameters)
+    if model_parameters is not None and redact_shared_fields:
+        standard_logging_object["model_parameters"] = _with_redacted_request_fields(model_parameters)
 
     response: Final = standard_logging_object.get("response")
     if response is not None:
         if isinstance(response, dict) and "output" in response:
             standard_logging_object["response"] = _redacted_responses_api_response(
-                response, redact_instructions=redact_instructions
+                response, redact_instructions=redact_shared_fields
             )
             redact_vertex_ai_metadata_from_logged_object(standard_logging_object["response"])
         elif isinstance(response, dict) and "choices" in response:
@@ -550,7 +644,7 @@ def _redact_model_response_dict_choices(choices: Iterable[object], redacted_str:
                 for field in ("content", "reasoning_content"):
                     if body.get(field) is not None:
                         body[field] = redacted_str
-                for field in ("thinking_blocks", "reasoning_items", "audio"):
+                for field in ("thinking_blocks", "reasoning_items", "audio", "images"):
                     if field in body:
                         body[field] = None
                 _redact_tool_calls_dict(body)
@@ -599,7 +693,7 @@ def redacted_litellm_params(params: Mapping[str, object], *, redact_request_body
     """
     request: Final = _as_mapping(params.get("proxy_server_request"))
     return {
-        **(_with_redacted_instructions(params) if redact_request_body else params),
+        **(_with_redacted_request_fields(params) if redact_request_body else params),
         **{
             key: _redacted_baseline_metadata(value)
             for key, value in params.items()
@@ -613,15 +707,15 @@ def redacted_litellm_params(params: Mapping[str, object], *, redact_request_body
     }
 
 
-def perform_redaction(model_call_details: dict, result, redact_streaming_responses: bool = True):
+def perform_redaction(model_call_details: dict[str, object], result, redact_streaming_responses: bool = True):
     """
     Performs the actual redaction on the logging object and result.
 
     redact_streaming_responses=False skips the in-place redaction of the shared streaming
     response entries; per-callback redaction hands each opted-out callback its own redacted
     copy via redacted_model_call_details_for_custom_logger instead. It also leaves the shared
-    request instructions, proxy request body and hidden provider fields as they are, since the
-    spend log and the other callbacks read them.
+    request instructions, guardrail prompt text, proxy request body and hidden provider fields
+    as they are, since the spend log and the other callbacks read them.
     """
     # Redact model_call_details
     params: Final = _as_mapping(model_call_details.get("litellm_params"))
@@ -638,15 +732,15 @@ def perform_redaction(model_call_details: dict, result, redact_streaming_respons
     if redact_streaming_responses:
         model_call_details.update(
             {
-                **({"instructions": REDACTED_BY_LITELLM} if model_call_details.get("instructions") is not None else {}),
-                **({"optional_params": _with_redacted_instructions(optional_params)} if optional_params else {}),
+                **_request_field_redactions(model_call_details),
+                **({"optional_params": _with_redacted_request_fields(optional_params)} if optional_params else {}),
             }
         )
     model_call_details.pop(SERVED_OUTPUT_TEXTS_KEY, None)
     standard_logging_object: Final = model_call_details.get("standard_logging_object")
     if isinstance(standard_logging_object, Mapping):
         model_call_details["standard_logging_object"] = _redact_standard_logging_object(
-            standard_logging_object, redact_instructions=redact_streaming_responses
+            standard_logging_object, redact_shared_fields=redact_streaming_responses
         )
     redact_vertex_ai_metadata_from_litellm_params(model_call_details)
 
@@ -709,7 +803,277 @@ def perform_redaction(model_call_details: dict, result, redact_streaming_respons
         return _result
 
 
-def should_redact_message_logging(model_call_details: dict) -> bool:
+def redact_logged_message_content(value: object) -> object:
+    """Copy of a debug payload with prompt and completion text replaced.
+
+    Model names, ids, token counts, and error strings stay. The same marker callback
+    logs already use is written in place of message text, so a process log cannot
+    keep a copy of the prompt or the reply.
+    """
+    return _redact_logged_value(value, 0)
+
+
+def _redact_logged_value(value: object, depth: int) -> object:
+    if depth >= _MAX_LOG_REDACTION_DEPTH:
+        return REDACTED_BY_LITELLM
+    if isinstance(value, str):
+        return _redact_logged_string(value, depth)
+    if isinstance(value, BaseModel):
+        return _redact_logged_model(value, depth)
+    if isinstance(value, dict):
+        return {key: _redact_logged_field(key, item, depth) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_redact_logged_value(item, depth + 1) for item in value)
+    if isinstance(value, list):
+        return [_redact_logged_value(item, depth + 1) for item in value]
+    return value
+
+
+def _repr_hidden_fields(model_type: type[BaseModel]) -> frozenset[str]:
+    return frozenset(name for name, field in model_type.model_fields.items() if not field.repr)
+
+
+def _extra_mapping(value: BaseModel) -> Mapping[str, object]:
+    extra: Final = getattr(value, "__pydantic_extra__", None)
+    if not isinstance(extra, dict):
+        return {}
+    return {key: item for key, item in extra.items() if isinstance(key, str)}
+
+
+def _visible_model_mapping(value: BaseModel) -> Mapping[str, object]:
+    """Field values a log may show. ``repr=False`` fields, such as a password, stay out."""
+    hidden: Final = _repr_hidden_fields(type(value))
+    declared: Final = frozenset(type(value).model_fields)
+    extra: Final = _extra_mapping(value)
+    visible_declared: Final = {
+        name: extra[name] if name in extra else getattr(value, name, None) for name in declared if name not in hidden
+    }
+    visible_extra: Final = {key: item for key, item in extra.items() if _keep_logged_extra(key, declared, hidden)}
+    return {**visible_declared, **visible_extra}
+
+
+def _keep_logged_extra(key: str, declared: frozenset[str], hidden: frozenset[str]) -> bool:
+    return key not in declared and key not in hidden
+
+
+def _redact_logged_model(value: BaseModel, depth: int) -> object:
+    try:
+        visible: Final = _visible_model_mapping(value)
+    except (TypeError, ValueError):
+        return REDACTED_BY_LITELLM
+    return _redact_logged_value(visible, depth + 1)
+
+
+def _redact_logged_field(key: object, item: object, depth: int) -> object:
+    if isinstance(key, str) and key in _LOGGED_MESSAGE_TEXT_KEYS:
+        return _redact_logged_text_field(item, depth)
+    return _redact_logged_value(item, depth + 1)
+
+
+def _redact_logged_text_field(item: object, depth: int) -> object:
+    if isinstance(item, str):
+        return item if item == "" else REDACTED_BY_LITELLM
+    return _redact_text_tree(item, depth)
+
+
+def _redact_text_tree(item: object, depth: int) -> object:
+    """Every string under a message field is content, including tool arguments and tool results."""
+    if depth >= _MAX_LOG_REDACTION_DEPTH:
+        return REDACTED_BY_LITELLM
+    if isinstance(item, str):
+        return item if item == "" else REDACTED_BY_LITELLM
+    if isinstance(item, dict):
+        return {key: _redact_text_tree(child, depth + 1) for key, child in item.items()}
+    if isinstance(item, list):
+        return [_redact_text_tree(child, depth + 1) for child in item]
+    if isinstance(item, tuple):
+        return tuple(_redact_text_tree(child, depth + 1) for child in item)
+    if isinstance(item, BaseModel):
+        return _redact_text_tree(_visible_model_mapping(item), depth + 1)
+    return item
+
+
+def _redact_logged_string(value: str, depth: int) -> str:
+    if "{" not in value and "[" not in value:
+        return value
+    if "}" not in value and "]" not in value:
+        return value
+    pieces: Final[list[str]] = []  # mutable-ok: one left-to-right scan of a log line
+    cursor = 0  # rebind-ok: the scan walks the line once
+    attempts = 0  # rebind-ok: counts failed span parses so a bracket flood cannot rescan the line
+    while cursor < len(value):
+        opener: Final = _next_logged_opener(value, cursor)
+        if opener is None:
+            pieces.append(value[cursor:])
+            break
+        if _no_logged_closer_after(value, opener):
+            pieces.append(value[cursor:])
+            break
+        end: Final = _logged_span_end(value, opener)
+        parsed: Final = None if end is None else _parse_logged_structure(value[opener:end])
+        if end is None or parsed is None:
+            attempts += 1
+            if attempts >= _MAX_LOGGED_SPAN_ATTEMPTS:
+                pieces.append(value[cursor:])
+                break
+            pieces.append(value[cursor : opener + 1])
+            cursor = opener + 1
+            continue
+        redacted: Final = _redact_logged_value(parsed[0], depth + 1)
+        rendered: Final = value[opener:end] if redacted == parsed[0] else _render_logged_structure(redacted, parsed[1])
+        pieces.append(value[cursor:opener])
+        pieces.append(rendered)
+        cursor = end
+    return "".join(pieces)
+
+
+def _no_logged_closer_after(value: str, start: int) -> bool:
+    return value.find("}", start) < 0 and value.find("]", start) < 0
+
+
+def _parse_logged_structure(span: str) -> tuple[object, bool] | None:
+    loaded: Final = safe_json_loads(span, default=None)
+    if isinstance(loaded, (dict, list)):
+        return (loaded, True)
+    try:
+        literal: Final = _LOGGED_STRUCTURE.validate_python(ast.literal_eval(span))
+    except (ValueError, SyntaxError, MemoryError, TypeError):
+        return None
+    if isinstance(literal, (dict, list, tuple)):
+        return (literal, False)
+    return None
+
+
+def _render_logged_structure(value: object, as_json: bool) -> str:
+    if not as_json:
+        return str(value)
+    try:
+        return json.dumps(value)
+    except TypeError:
+        return str(value)
+
+
+def _next_logged_opener(value: str, start: int) -> int | None:
+    brace: Final = value.find("{", start)
+    bracket: Final = value.find("[", start)
+    if brace < 0:
+        return None if bracket < 0 else bracket
+    if bracket < 0:
+        return brace
+    return min(brace, bracket)
+
+
+def _logged_span_end(value: str, start: int) -> int | None:
+    closers: Final = {"}": "{", "]": "["}
+    stack: Final[list[str]] = []  # mutable-ok: brace matcher for one log span
+    quote: str | None = None  # rebind-ok: quote state while scanning one log span
+    escaped = False  # rebind-ok: escape state while scanning one log span
+    for index, char in enumerate(value[start:], start):
+        if quote is not None:
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+            continue
+        if char in "{[":
+            stack.append(char)
+            continue
+        if char not in "}]":
+            continue
+        if not stack or stack[-1] != closers[char]:
+            return None
+        stack.pop()
+        if not stack:
+            return index + 1
+    return None
+
+
+def redact_debug_call_argument(key: str, value: object) -> object:
+    """Replacement for one argument of a ``litellm.<call>(...)`` debug line."""
+    if key not in _DEBUG_CALL_ARGUMENT_KEYS or value is None or value in ("", [], {}):
+        return value
+    return REDACTED_BY_LITELLM
+
+
+def _flag_is_true(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return str_to_bool(value) is True
+    return False
+
+
+def _headers_disable_message_redaction(headers: object) -> bool:
+    return isinstance(headers, Mapping) and _flag_is_true(headers.get("litellm-disable-message-redaction"))
+
+
+def _headers_enable_message_redaction(headers: object) -> bool:
+    if not isinstance(headers, Mapping) or _headers_disable_message_redaction(headers):
+        return False
+    return any(_flag_is_true(headers.get(name)) for name in MESSAGE_REDACTION_ENABLE_HEADERS)
+
+
+def _metadata_opts_into_message_redaction(metadata: object) -> bool:
+    if not isinstance(metadata, Mapping) or _headers_disable_message_redaction(metadata.get("headers")):
+        return False
+    if _flag_is_true(metadata.get("turn_off_message_logging")):
+        return True
+    return _headers_enable_message_redaction(metadata.get("headers"))
+
+
+def call_kwargs_opt_into_message_redaction(kwargs: Mapping[str, object]) -> bool:
+    """True when this call asked to keep message content out of logs."""
+    litellm_params: Final = kwargs.get("litellm_params")
+    nested_metadata: Final = litellm_params.get("metadata") if isinstance(litellm_params, Mapping) else None
+    if (
+        _headers_disable_message_redaction(_mapping_headers(kwargs.get("metadata")))
+        or _headers_disable_message_redaction(_mapping_headers(kwargs.get("litellm_metadata")))
+        or _headers_disable_message_redaction(_mapping_headers(nested_metadata))
+    ):
+        return False
+    if _flag_is_true(kwargs.get("turn_off_message_logging")):
+        return True
+    if _metadata_opts_into_message_redaction(kwargs.get("metadata")):
+        return True
+    if _metadata_opts_into_message_redaction(kwargs.get("litellm_metadata")):
+        return True
+    return _metadata_opts_into_message_redaction(nested_metadata)
+
+
+def _mapping_headers(metadata: object) -> object:
+    if not isinstance(metadata, Mapping):
+        return None
+    return metadata.get("headers")
+
+
+def proxy_request_opts_into_message_redaction(data: object, headers: Mapping[str, str]) -> bool:
+    """True when this proxy request asked to keep message content out of logs."""
+    if _headers_disable_message_redaction(headers):
+        return False
+    if isinstance(data, Mapping) and (
+        _headers_disable_message_redaction(_mapping_headers(data.get("metadata")))
+        or _headers_disable_message_redaction(_mapping_headers(data.get("litellm_metadata")))
+    ):
+        return False
+    if _headers_enable_message_redaction(headers):
+        return True
+    if not isinstance(data, Mapping):
+        return False
+    if _flag_is_true(data.get("turn_off_message_logging")):
+        return True
+    if _metadata_opts_into_message_redaction(data.get("metadata")):
+        return True
+    return _metadata_opts_into_message_redaction(data.get("litellm_metadata"))
+
+
+def should_redact_message_logging(model_call_details: Mapping[str, object]) -> bool:
     """
     Determine if message logging should be redacted.
 
@@ -767,7 +1131,7 @@ def redact_message_input_output_from_logging(model_call_details: dict, result, i
 
 
 def _get_turn_off_message_logging_from_dynamic_params(
-    model_call_details: dict,
+    model_call_details: Mapping[str, object],
 ) -> bool | None:
     """
     gets the value of `turn_off_message_logging` from the dynamic params, if it exists.
